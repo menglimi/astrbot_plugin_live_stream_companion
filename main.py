@@ -2034,32 +2034,42 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
             logger.warning(f"[B站直播] 读取自动回应会话对话失败: {e}")
             return False
 
-        prompt = (
-            "【B站直播间弹幕事件】\n"
-            "请像正在直播中收到弹幕一样回应直播间观众。\n"
-            f"{self._bili_live_reply_identity_prompt_line()}\n"
+        # Instructions and background context go to the system prompt; the user prompt
+        # stays a clean danmaku transcript. AstrBot retrieves the knowledge base with
+        # req.prompt (astr_main_agent._apply_kb), so mixing static instructions into it
+        # hijacks the retrieval query: the wording of the instructions dominates the
+        # embedding and the search returns speech-style documents for every danmaku.
+        instructions = [
+            "【B站直播间弹幕事件】",
+            "请像正在直播中收到弹幕一样回应直播间观众。",
+            self._bili_live_reply_identity_prompt_line(),
             "身份边界：下面的用户名是 B站直播间观众昵称，不是当前私聊对象，也不等于私聊历史里的用户或群友；"
-            "不要把私聊记忆、旧对话人物、现实称呼代入当前弹幕。\n"
+            "不要把私聊记忆、旧对话人物、现实称呼代入当前弹幕。",
             "要求：自然回应，不要逐条复读；优先回应具体问题或反馈；不要说自己看不到弹幕；"
             "不要把每条弹幕都当成进场问候，除非当前弹幕本身就是问候且确实需要回应；"
             "不要反复使用“欢迎/你好/来啦/好久不见”这类开场白；"
             "如果弹幕只是“摸摸/贴贴/抱抱”这类互动，就按当前直播身份自然回应这个观众，"
-            "不要说第三个人在摸你，也不要提无关照片、日程或旧聊天。\n"
-            "只输出要发给直播间观众的话，不要描述发送状态、处理过程或自己的回应策略。\n\n"
-            f"{formatted}"
-        )
-        prompt += self._build_bili_support_reply_hint(selected)
+            "不要说第三个人在摸你，也不要提无关照片、日程或旧聊天。",
+            "只输出要发给直播间观众的话，不要描述发送状态、处理过程或自己的回应策略。",
+        ]
+        support_hint = self._build_bili_support_reply_hint(selected)
+        if support_hint.strip():
+            instructions.append(support_hint.strip())
         auxiliary_context = await self._build_bili_live_auxiliary_context(selected)
         if auxiliary_context:
-            prompt += "\n\n" + auxiliary_context
+            instructions.append(auxiliary_context)
         living_context = await self._build_living_memory_live_context(session_id, selected)
         if living_context:
-            prompt += "\n\n" + living_context
+            instructions.append(living_context)
         if self.config.get("bili_live_auto_reply_force_full_tts", True):
-            prompt += (
-                "\n\n请只输出普通文本回复，不要调用工具，不要写 <record>、<voice>、"
-                "<语音>、<send_message_to_user> 等标签；如果需要语音，系统 TTS 插件会自动处理。"
+            # Keep the tag list exhaustive instead of open-ended ("等标签"), otherwise the
+            # model generalises the ban to the invisible <soullink> emotion tag as well.
+            instructions.append(
+                "请只输出普通文本回复，不要调用工具，不要写 <record>、<voice>、"
+                "<语音>、<send_message_to_user> 这些标签；如果需要语音，系统 TTS 插件会自动处理。"
             )
+        system_prompt = "\n\n".join(instructions)
+        prompt = formatted
 
         try:
             synthetic_event = SyntheticBiliLiveWakeEvent(
@@ -2082,9 +2092,17 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
             )
             req = ProviderRequest(
                 prompt=prompt,
+                system_prompt=system_prompt,
                 conversation=conv,
                 session_id=session_id,
             )
+            # Native replies call build_main_agent directly instead of going through the
+            # AstrBot pipeline, so on_llm_request hooks never fire and our own Soullink
+            # prompt injection would be skipped -- live replies would drive the Live2D
+            # model with idle motion only. The matching on_llm_response hook *does* fire
+            # (the runner carries MAIN_AGENT_HOOKS), so re-applying the injection here is
+            # enough to close the loop. No-ops when Soullink is disabled.
+            self._inject_soullink_prompt_instruction(req)
             t_build = time.perf_counter()
             result = await build_main_agent(
                 event=synthetic_event,
