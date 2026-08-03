@@ -6,11 +6,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from aiohttp import WSMsgType, web
 
 from astrbot.api import logger
+
+MAX_AUDIO_ENTRIES = 10
 
 
 class SubtitleServer:
@@ -23,6 +27,7 @@ class SubtitleServer:
         self._site: web.TCPSite | None = None
         self._clients: set[web.WebSocketResponse] = set()
         self._last_payload: dict[str, Any] | None = None
+        self._audio_files: OrderedDict[str, str] = OrderedDict()
 
     @property
     def url(self) -> str:
@@ -38,6 +43,7 @@ class SubtitleServer:
         self._app.router.add_get("/show", self._handle_show)
         self._app.router.add_post("/show", self._handle_show)
         self._app.router.add_get("/clear", self._handle_clear)
+        self._app.router.add_get("/audio/{token}", self._handle_audio)
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, self.host, self.port)
@@ -54,6 +60,7 @@ class SubtitleServer:
         self._app = None
         self._runner = None
         self._site = None
+        self._audio_files.clear()
         logger.info("[字幕] 字幕 overlay 已停止")
 
     async def show(self, text: str) -> None:
@@ -68,6 +75,22 @@ class SubtitleServer:
         payload = {"type": "clear"}
         self._last_payload = None
         await self._broadcast(payload)
+
+    async def register_audio(self, token: str, audio_path: str) -> bool:
+        """登记一段 TTS 音频并广播给 overlay 客户端。
+
+        音频是瞬时事件，不写入 _last_payload：新连接不应该补播旧语音。
+        """
+        token = (token or "").strip()
+        path = str(audio_path or "").strip()
+        if not token or not path:
+            return False
+        self._audio_files[token] = path
+        self._audio_files.move_to_end(token)
+        while len(self._audio_files) > MAX_AUDIO_ENTRIES:
+            self._audio_files.popitem(last=False)
+        await self._broadcast({"type": "audio", "token": token})
+        return True
 
     async def _broadcast(self, payload: dict[str, Any]) -> None:
         if not self._clients:
@@ -100,6 +123,20 @@ class SubtitleServer:
     async def _handle_clear(self, request: web.Request) -> web.Response:
         await self.clear()
         return web.json_response({"ok": True, "clients": len(self._clients)})
+
+    async def _handle_audio(self, request: web.Request) -> web.StreamResponse:
+        token = str(request.match_info.get("token") or "").strip()
+        path = self._audio_files.get(token) if token else ""
+        if not path:
+            raise web.HTTPNotFound()
+        audio_file = Path(path)
+        if not audio_file.is_file():
+            self._audio_files.pop(token, None)
+            raise web.HTTPNotFound()
+        return web.FileResponse(
+            audio_file,
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _handle_index(self, request: web.Request) -> web.Response:
         html = self._render_html()
@@ -187,10 +224,12 @@ class SubtitleServer:
 </head>
 <body>
   <div id="stage"><div id="subtitle"></div></div>
+  <audio id="tts-audio" hidden preload="auto"></audio>
   <script>
     const defaultStyle = {style_json};
     const root = document.documentElement;
     const subtitle = document.getElementById("subtitle");
+    const ttsAudio = document.getElementById("tts-audio");
     let typingToken = 0;
 
     function sleep(ms) {{
@@ -251,6 +290,25 @@ class SubtitleServer:
       subtitle.textContent = "";
     }}
 
+    function releaseAudio() {{
+      ttsAudio.pause();
+      ttsAudio.removeAttribute("src");
+      ttsAudio.load();
+    }}
+
+    function playAudio(token) {{
+      if (!token) return;
+      releaseAudio();
+      ttsAudio.src = `${{location.origin}}/audio/${{encodeURIComponent(token)}}`;
+      const attempt = ttsAudio.play();
+      if (attempt && typeof attempt.catch === "function") {{
+        attempt.catch(() => {{}});
+      }}
+    }}
+
+    ttsAudio.addEventListener("ended", releaseAudio);
+    ttsAudio.addEventListener("error", releaseAudio);
+
     function connect() {{
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${{protocol}}//${{location.host}}/ws`);
@@ -258,6 +316,7 @@ class SubtitleServer:
         const payload = JSON.parse(event.data);
         if (payload.type === "subtitle") typeSubtitle(payload.text, payload.style);
         if (payload.type === "clear") clearSubtitle();
+        if (payload.type === "audio") playAudio(payload.token);
       }};
       ws.onclose = () => setTimeout(connect, 1000);
     }}

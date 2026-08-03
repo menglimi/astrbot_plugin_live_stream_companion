@@ -807,6 +807,12 @@
     "hint": "开启后，直播自动回应的 TTS 音频生成成功后由本插件直接在本机播放，不再只依赖陪伴插件回调。播放顺序为 ffplay、Windows PowerShell MediaPlayer、winsound 兜底；winsound 会禁用默认错误提示音。",
     "default": true
   },
+  "bili_live_tts_web_playback_enabled": {
+    "description": "直播 TTS 网页播放",
+    "type": "bool",
+    "hint": "开启后，直播自动回应的 TTS 音频会推送到打字机字幕 overlay 页面，由 OBS 浏览器源播放出声。适合 AstrBot 在服务器、直播在另一台机器的场景（此时本机播放传不到直播间）。需要同时开启“启用打字机字幕 overlay”，并把字幕服务监听地址改成 0.0.0.0 或服务器局域网 IP。",
+    "default": false
+  },
   "bili_live_reply_identity_mode": {
     "description": "直播回复身份模式",
     "type": "string",
@@ -937,13 +943,13 @@
   "subtitle_host": {
     "description": "字幕服务监听地址",
     "type": "string",
-    "hint": "OBS 和浏览器通常使用 127.0.0.1 即可",
+    "hint": "OBS 和插件在同一台机器时用 127.0.0.1 即可。AstrBot 在服务器、OBS 在另一台机器时，必须改成 0.0.0.0 或服务器局域网 IP，否则直播机连不上字幕和 TTS 网页播放。",
     "default": "127.0.0.1"
   },
   "subtitle_port": {
     "description": "字幕服务端口",
     "type": "int",
-    "hint": "OBS 浏览器源地址默认为 http://127.0.0.1:18081/",
+    "hint": "OBS 浏览器源地址默认为 http://127.0.0.1:18081/；跨机器时改成 http://<服务器局域网IP>:18081/",
     "default": 18081
   },
   "subtitle_typing_speed_ms": {

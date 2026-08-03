@@ -2388,6 +2388,8 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
         )
         if schedule_local_playback:
             self._schedule_bili_live_tts_local_playback(record_audio_path)
+        if self._bili_live_tts_web_playback_enabled():
+            await self._push_tts_audio_to_overlay(record_audio_path)
         asyncio.create_task(
             self._after_bili_live_tts_audio_generated(
                 record_audio_path,
@@ -2462,6 +2464,9 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
         if spoken_display and not re.search(r"[\u3040-\u30ff]", spoken_display):
             return spoken_display
         return visible
+
+    def _bili_live_tts_web_playback_enabled(self) -> bool:
+        return bool(self.config.get("bili_live_tts_web_playback_enabled", False))
 
     def _schedule_bili_live_tts_local_playback(self, audio_path: str) -> None:
         if not bool(self.config.get("bili_live_tts_local_playback_enabled", True)):

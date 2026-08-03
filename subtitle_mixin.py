@@ -6,6 +6,7 @@
 """
 
 import re
+import uuid
 from typing import Any
 
 from astrbot.api import logger
@@ -120,6 +121,27 @@ class SubtitleMixin:
         if cleaned:
             self._subtitle_server.style = self._get_subtitle_style()
             await self._subtitle_server.show(cleaned)
+
+    async def _push_tts_audio_to_overlay(self, audio_path: str) -> bool:
+        """把 TTS 音频交给字幕 overlay 页面播放。
+
+        用于 AstrBot 与直播机不在同一台机器的场景：服务端本机播放传不到
+        直播间，改由 OBS 浏览器源加载的 overlay 页面播放。
+        """
+        if not self._is_subtitle_enabled():
+            return False
+        path = str(audio_path or "").strip()
+        if not path:
+            return False
+        if not self._subtitle_server:
+            await self._start_subtitle_server_if_enabled()
+        if not self._subtitle_server:
+            return False
+        try:
+            return await self._subtitle_server.register_audio(uuid.uuid4().hex, path)
+        except Exception as e:
+            logger.warning(f"[字幕] 推送直播 TTS 音频到 overlay 失败: {e}")
+            return False
 
     def _extract_subtitle_text_from_result(self, result) -> str:
         chain = getattr(result, "chain", None)

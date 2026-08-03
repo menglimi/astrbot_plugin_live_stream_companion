@@ -204,6 +204,30 @@ http://127.0.0.1:18081/
 subtitle_scope = all
 ```
 
+### 5.1 AstrBot 和 OBS 不在同一台机器：让 TTS 从浏览器源出声
+
+`bili_live_tts_local_playback_enabled` 是在 **AstrBot 所在机器**上播放音频。如果 AstrBot 跑在服务器、OBS 在本机，服务器上播出来的声音进不了直播间。这种情况改用网页播放：TTS 音频推送到字幕 overlay 页面，由 OBS 浏览器源播放。
+
+配置里开启：
+
+```text
+subtitle_enabled = true
+subtitle_host = 0.0.0.0
+bili_live_tts_web_playback_enabled = true
+```
+
+`subtitle_host` 必须改成 `0.0.0.0` 或服务器局域网 IP，默认的 `127.0.0.1` 只监听本机，直播机连不上。
+
+OBS 浏览器源的 URL 也要换成服务器地址：
+
+```text
+http://<服务器局域网IP>:18081/
+```
+
+字幕和语音走同一个页面、同一个端口，所以浏览器源只需要加一个。加好之后，在 OBS 混音器里把这个浏览器源的音频路由进直播流的音频通道，观众才能听到。
+
+本机播放和网页播放互不影响，可以同时开；服务器上没有声卡或播放器时，把 `bili_live_tts_local_playback_enabled` 关掉即可。
+
 ### 6. 接上 TTS 嘴型
 
 配置里开启：
@@ -423,6 +447,7 @@ bilibili_ROOM_OWNER_AUTH_CODE
 | `bili_live_auto_reply_max_per_minute` | `6` | 每分钟最多自动回应 |
 | `bili_live_auto_reply_sync_tts_subtitle` | `true` | 开启后直播自动回应等待 TTS，并与打字机字幕同步 |
 | `bili_live_tts_local_playback_enabled` | `true` | 直播 TTS 生成后由本插件直接本机播放 |
+| `bili_live_tts_web_playback_enabled` | `false` | 直播 TTS 推送到字幕 overlay 页面，由 OBS 浏览器源播放；跨机器部署时用它替代本机播放 |
 
 ### OBS 和字幕
 
@@ -430,6 +455,7 @@ bilibili_ROOM_OWNER_AUTH_CODE
 |---|---:|---|
 | `subtitle_enabled` | `false` | 启用透明字幕层 |
 | `subtitle_scope` | `bili_live` | `bili_live` 只显示直播自动回应，`all` 显示所有 Bot 回复 |
+| `subtitle_host` | `127.0.0.1` | 字幕/音频服务监听地址；跨机器时改 `0.0.0.0` 或服务器局域网 IP |
 | `subtitle_port` | `18081` | 字幕网页端口 |
 | `obs_control_enabled` | `false` | 启用 OBS 控制 |
 | `obs_allow_stream_start` | `false` | 是否允许插件调用 OBS 推流 |
