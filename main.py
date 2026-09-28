@@ -59,6 +59,14 @@ from .bilibili_live import (
 )
 from .l2d_mixin import Live2DMixin
 from .mouth_sync_mixin import MouthSyncMixin
+from .live_tts_params import (
+    StyleIntentCache,
+    build_external_tts_kwargs,
+    build_style_hint,
+    describe_intent,
+    map_emotion,
+    supported_kwargs,
+)
 from .soullink_mixin import SoullinkMixin
 from .soullink_runtime import SoullinkRuntimeBridge
 from .subtitle_mixin import SubtitleMixin
@@ -214,7 +222,7 @@ class SyntheticBiliLiveWakeEvent(AstrMessageEvent):
     "astrbot_plugin_live_stream_companion",
     "menglimi",
     "B站/Twitch 直播弹幕读取、自动回应、Live2D 表情动作、OBS 字幕和 TTS 嘴型联动",
-    "1.8.1",
+    "1.8.2",
     "https://github.com/menglimi/astrbot_plugin_live_stream_companion",
 )
 class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixin, Star):
@@ -337,6 +345,8 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
         self._soullink_gaze_y = 0.5
         self._soullink_gaze_last_update_at = 0.0
         self._soullink_gaze_last_error = ""
+        #: 最近一条回复的情绪意图（供同一条回复的 TTS 复用；按文本指纹匹配）
+        self._live_tts_style_cache = StyleIntentCache()
         self._connected = False
 
     def _register_page_api_if_available(self) -> None:
@@ -2545,29 +2555,67 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
         spoken = self._strip_tts_blocks_from_text(text)
         if not spoken:
             return {}
-        try:
-            tts_provider = self.context.get_using_tts_provider(session_id)
-        except Exception as e:
-            logger.warning("[B站直播] 直播自动回应 TTS 生成失败：未找到会话 TTS Provider session=%s err=%s", session_id, e)
-            return {}
-        if not tts_provider:
-            logger.warning("[B站直播] 直播自动回应 TTS 生成失败：当前会话未配置 TTS Provider session=%s", session_id)
-            return {}
+        # 外部 TTS 的情绪/语气透传：情绪来自同一条回复的 Soullink 意图（可能为空）。
+        tts_emotion, tts_style_hint = self._live_tts_style_values(text)
+        backend = self._live_tts_backend()
+        tts_service: Any | None = None
+        backend_label = "AstrBot Provider"
+        if backend in {"registered_service", "auto"}:
+            tts_service = self._find_live_tts_registered_service()
+            if tts_service is not None:
+                backend_label = "已注册外部服务"
+            elif backend == "registered_service":
+                logger.warning("[B站直播] 直播自动回应 TTS 生成失败：未找到已配置的外部 TTS 服务")
+                return {}
+        if tts_service is None:
+            tts_service = self._get_live_tts_provider(session_id)
+            if tts_service is None:
+                return {}
         convert_started_at = time.perf_counter()
-        spoken = await self._convert_bili_live_tts_spoken_text(session_id, spoken, tts_provider)
+        spoken = await self._convert_bili_live_tts_spoken_text(session_id, spoken, tts_service)
         spoken = self._sanitize_bili_live_tts_spoken_text(spoken, source_text=text)
         convert_elapsed = time.perf_counter() - convert_started_at
         if not spoken:
             return {}
         try:
             tts_started_at = time.perf_counter()
-            audio_path = await tts_provider.get_audio(spoken)
+            if backend_label == "已注册外部服务":
+                audio_path = await self._synthesize_live_tts_with_registered_service(
+                    tts_service,
+                    spoken,
+                    session_id,
+                    emotion=tts_emotion,
+                    style_hint=tts_style_hint,
+                )
+                if not audio_path and backend == "auto":
+                    logger.warning("[B站直播] 外部 TTS 服务未生成音频，回退 AstrBot TTS Provider")
+                    tts_service = self._get_live_tts_provider(session_id)
+                    if tts_service is None:
+                        return {}
+                    backend_label = "AstrBot Provider（外部回退）"
+                    audio_path = await tts_service.get_audio(spoken)
+            else:
+                audio_path = await tts_service.get_audio(spoken)
             tts_elapsed = time.perf_counter() - tts_started_at
         except Exception as e:
-            logger.warning("[B站直播] 直播自动回应 TTS 生成失败: %s", e)
-            return {}
+            if backend_label == "已注册外部服务" and backend == "auto":
+                logger.warning("[B站直播] 外部 TTS 服务生成失败，回退 AstrBot TTS Provider: %s", e)
+                provider = self._get_live_tts_provider(session_id)
+                if provider is None:
+                    return {}
+                try:
+                    tts_started_at = time.perf_counter()
+                    audio_path = await provider.get_audio(spoken)
+                    tts_elapsed = time.perf_counter() - tts_started_at
+                    backend_label = "AstrBot Provider（外部回退）"
+                except Exception as fallback_error:
+                    logger.warning("[B站直播] 直播自动回应 TTS 回退生成失败: %s", fallback_error)
+                    return {}
+            else:
+                logger.warning("[B站直播] 直播自动回应 TTS 生成失败: %s", e)
+                return {}
         if not audio_path:
-            logger.warning("[B站直播] 直播自动回应 TTS 生成失败：Provider 未返回音频路径")
+            logger.warning("[B站直播] 直播自动回应 TTS 生成失败：%s 未返回音频路径", backend_label)
             return {}
         audio_path = str(audio_path)
         record_audio_path = self._prepare_bili_live_audio_for_record(audio_path)
@@ -2599,8 +2647,9 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
         if push_subtitle and not self._companion_tts_live_subtitle_enabled():
             await self._push_subtitle(subtitle_text, source="bili_live")
         logger.info(
-            "[B站直播] 已生成直播自动回应 TTS: convert=%.2fs provider=%.2fs path=%s text=%s",
+            "[B站直播] 已生成直播自动回应 TTS: convert=%.2fs backend=%s synthesize=%.2fs path=%s text=%s",
             convert_elapsed,
+            backend_label,
             tts_elapsed,
             record_audio_path,
             spoken[:80],
@@ -2612,6 +2661,216 @@ class VTubeStudioPlugin(SubtitleMixin, MouthSyncMixin, Live2DMixin, SoullinkMixi
             "audio_path": record_audio_path,
             "source_audio_path": audio_path,
         }
+
+    def _live_tts_backend(self) -> str:
+        backend = str(self.config.get("live_tts_backend", "astrbot_provider") or "").strip().lower()
+        if backend in {"astrbot_provider", "registered_service", "auto"}:
+            return backend
+        logger.warning("[B站直播] 未知直播 TTS 后端 %r，使用 astrbot_provider", backend)
+        return "astrbot_provider"
+
+    def _get_live_tts_provider(self, session_id: str) -> Any | None:
+        try:
+            provider = self.context.get_using_tts_provider(session_id)
+        except Exception as e:
+            logger.warning(
+                "[B站直播] 直播自动回应 TTS 生成失败：未找到会话 TTS Provider session=%s err=%s",
+                session_id,
+                e,
+            )
+            return None
+        if not provider:
+            logger.warning(
+                "[B站直播] 直播自动回应 TTS 生成失败：当前会话未配置 TTS Provider session=%s",
+                session_id,
+            )
+        return provider
+
+    @staticmethod
+    def _live_tts_plugin_from_handler(handler: Any, method_name: str) -> Any | None:
+        pending = [handler]
+        visited: set[int] = set()
+        while pending:
+            current = pending.pop(0)
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+            owner = getattr(current, "__self__", None)
+            if owner is not None:
+                pending.append(owner)
+            pending.extend(list(getattr(current, "args", ()) or ()))
+            wrapped = getattr(current, "func", None)
+            if wrapped is not None and wrapped is not current:
+                pending.append(wrapped)
+            if current is not handler and callable(getattr(current, method_name, None)):
+                return current
+        return None
+
+    def _find_live_tts_registered_service(self) -> Any | None:
+        tool_name = str(self.config.get("live_tts_external_tool_name", "") or "").strip()
+        method_name = str(
+            self.config.get("live_tts_external_service_method", "text_to_speech") or ""
+        ).strip()
+        if not tool_name or not method_name:
+            return None
+        try:
+            manager = self.context.get_llm_tool_manager()
+        except Exception as e:
+            logger.warning("[B站直播] 读取外部 TTS 工具管理器失败: %s", e)
+            return None
+        tool = None
+        get_tool = getattr(manager, "get_tool", None)
+        if callable(get_tool):
+            try:
+                tool = get_tool(tool_name)
+            except Exception:
+                tool = None
+        if tool is None:
+            get_func = getattr(manager, "get_func", None)
+            if callable(get_func):
+                try:
+                    tool = get_func(tool_name)
+                except Exception:
+                    tool = None
+        plugin = self._live_tts_plugin_from_handler(
+            getattr(tool, "handler", None), method_name
+        )
+        if plugin is None:
+            logger.warning("[B站直播] 已找到外部 TTS 工具但无法取得所属插件: tool=%s", tool_name)
+            return None
+        expected_name = str(self.config.get("live_tts_external_plugin_name", "") or "").strip()
+        if expected_name:
+            actual_names = {
+                str(getattr(plugin, attr, "") or "").strip()
+                for attr in ("name", "plugin_id")
+            }
+            metadata = getattr(plugin, "metadata", None)
+            actual_names.update(
+                str(getattr(metadata, attr, "") or "").strip()
+                for attr in ("name", "plugin_id")
+            )
+            actual_names.update(
+                part.strip()
+                for part in str(getattr(plugin, "__module__", "") or "").split(".")
+            )
+            actual_names.discard("")
+            if expected_name not in actual_names:
+                logger.warning(
+                    "[B站直播] 外部 TTS 工具所属插件不匹配: tool=%s expected=%s actual=%s",
+                    tool_name,
+                    expected_name,
+                    sorted(name for name in actual_names if name),
+                )
+                return None
+        if not callable(getattr(plugin, method_name, None)):
+            logger.warning(
+                "[B站直播] 外部 TTS 插件未提供公开合成方法: tool=%s method=%s",
+                tool_name,
+                method_name,
+            )
+            return None
+        return plugin
+
+    @staticmethod
+    def _live_tts_supported_kwargs(method: Any, values: dict[str, Any]) -> dict[str, Any]:
+        """按目标方法签名裁剪入参（实现收敛到 live_tts_params，便于单测）。"""
+        return supported_kwargs(method, values)
+
+    @staticmethod
+    async def _await_live_tts_result(result: Any) -> Any:
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    @staticmethod
+    def _live_tts_audio_path_from_result(result: Any) -> str:
+        if isinstance(result, (list, tuple)):
+            result = result[0] if result else ""
+        if isinstance(result, os.PathLike):
+            return os.fspath(result)
+        if isinstance(result, str):
+            return result.strip()
+        if isinstance(result, dict):
+            for key in ("audio_path", "output_path", "path", "file", "url"):
+                value = result.get(key)
+                if isinstance(value, os.PathLike):
+                    return os.fspath(value)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for attr in ("audio_path", "output_path", "path", "file", "url"):
+            value = getattr(result, attr, "")
+            if isinstance(value, os.PathLike):
+                return os.fspath(value)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _live_tts_style_intent_for(self, text: str) -> dict[str, Any]:
+        """取出与 ``text`` 匹配的 Soullink 情绪意图；不匹配就返回空。"""
+        cache = getattr(self, "_live_tts_style_cache", None)
+        if cache is None:
+            return {}
+        payload = cache.get(text)
+        return payload if isinstance(payload, dict) else {}
+
+    def _live_tts_style_values(self, text: str) -> tuple[str, str]:
+        """把回复情绪翻译成外部 TTS 的 (通用情绪, 语气提示)。
+
+        任一开关关闭或没有命中意图时都返回空值，外部服务行为与旧版本一致。
+        """
+        intent = self._live_tts_style_intent_for(text)
+        raw = str(intent.get("emotion") or "").strip()
+        if not raw or not self._live_tts_emotion_passthrough_enabled():
+            return "", ""
+        emotion = map_emotion(raw)
+        hint = ""
+        if self._live_tts_style_hint_enabled():
+            hint = build_style_hint(
+                raw,
+                intensity=intent.get("intensity"),
+                variant=intent.get("variant") or "",
+            )
+        return emotion, hint
+
+    def _live_tts_emotion_passthrough_enabled(self) -> bool:
+        return bool(self.config.get("live_tts_emotion_passthrough_enabled", True))
+
+    def _live_tts_style_hint_enabled(self) -> bool:
+        return bool(self.config.get("live_tts_style_hint_enabled", False))
+
+    async def _synthesize_live_tts_with_registered_service(
+        self,
+        plugin: Any,
+        text: str,
+        session_id: str,
+        *,
+        emotion: str = "",
+        style_hint: str = "",
+    ) -> str:
+        method_name = str(
+            self.config.get("live_tts_external_service_method", "text_to_speech") or ""
+        ).strip()
+        method = getattr(plugin, method_name)
+        # 通用入参 + 按签名裁剪：对方不认识 emotion/context 时自动不传（旧行为不变）。
+        kwargs = self._live_tts_supported_kwargs(
+            method,
+            build_external_tts_kwargs(
+                session_id=session_id,
+                emotion=emotion,
+                style_hint=style_hint,
+                style_enabled=self._live_tts_style_hint_enabled(),
+            ),
+        )
+        try:
+            configured_timeout = int(
+                self.config.get("live_tts_external_timeout_seconds", 60) or 60
+            )
+        except (TypeError, ValueError):
+            configured_timeout = 60
+        timeout = max(5, min(180, configured_timeout))
+        result = method(text, **kwargs)
+        result = await asyncio.wait_for(self._await_live_tts_result(result), timeout=timeout)
+        return self._live_tts_audio_path_from_result(result)
 
     def _sanitize_bili_live_tts_spoken_text(self, text: str, *, source_text: str = "") -> str:
         cleaned = self._strip_tts_blocks_from_text(text)

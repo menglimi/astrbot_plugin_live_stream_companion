@@ -16,7 +16,7 @@ import json
 import os
 import platform
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from astrbot.api import logger
 
@@ -391,3 +391,79 @@ def get_install_info() -> dict:
         "exe_path": str(exe_path) if exe_path else None,
         "config_port": read_port_from_config(),
     }
+
+
+# ------------------------------------------------------------------ #
+#  远程 VTS 探测（拓展页下拉选项用）
+# ------------------------------------------------------------------ #
+
+async def probe_vts(host: str, port: int, timeout: float = 1.2) -> str | None:
+    """探测某个地址是否是 VTube Studio API。
+
+    成功时返回 VTS 版本号（形如 ``1.35.10``），失败返回 ``None``。
+    """
+    ws = None
+    try:
+        import websockets as ws_lib
+
+        ws = await asyncio.wait_for(
+            ws_lib.connect(f"ws://{host}:{port}", open_timeout=timeout, close_timeout=1),
+            timeout=timeout + 1,
+        )
+        payload = json.dumps(
+            {
+                "apiName": "VTubeStudioPublicAPI",
+                "apiVersion": "1.0",
+                "requestID": "probe",
+                "messageType": "APIStateRequest",
+                "data": {},
+            }
+        )
+        await ws.send(payload)
+        resp_raw = await asyncio.wait_for(ws.recv(), timeout=timeout + 1)
+        resp = json.loads(resp_raw)
+        if resp.get("apiName") != "VTubeStudioPublicAPI":
+            return None
+        data = resp.get("data") or {}
+        return str(data.get("vTubeStudioVersion") or "")
+    except Exception:
+        return None
+    finally:
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+
+async def scan_vts_hosts(
+    hosts: Iterable[str],
+    ports: Iterable[int] = (VTS_DEFAULT_PORT,),
+    timeout: float = 0.8,
+    concurrency: int = 96,
+) -> List[dict]:
+    """并发探测一批 ``host`` × ``port``，返回命中的 VTS 实例。
+
+    返回形如 ``[{"host": "192.168.1.10", "port": 8001, "version": "1.35.10"}]``。
+    """
+    host_list = [str(host).strip() for host in hosts or [] if str(host).strip()]
+    port_list = [int(port) for port in ports or [] if port]
+    if not host_list or not port_list:
+        return []
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _probe(host: str, port: int) -> dict | None:
+        async with semaphore:
+            version = await probe_vts(host, port, timeout=timeout)
+        if version is None:
+            return None
+        return {"host": host, "port": port, "version": version}
+
+    tasks = [_probe(host, port) for host in host_list for port in port_list]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    found: List[dict] = []
+    for item in results:
+        if isinstance(item, dict):
+            found.append(item)
+    found.sort(key=lambda entry: (entry.get("host", ""), entry.get("port", 0)))
+    return found

@@ -7,7 +7,7 @@
   "vts_host": {
     "description": "VTube Studio 的 IP 地址",
     "type": "string",
-    "hint": "VTube Studio 所在主机，默认 localhost"
+    "hint": "在拓展页「直播面板 → 直播语音 / 远程 VTS」里可从下拉框选择探测到的 VTS（点「扫描局域网」重新扫描），也可以手动填写局域网 IP，例如 192.168.1.10；AstrBot 与 VTS 不同机时必须填写。"
   },
   "vts_port": {
     "description": "VTube Studio WebSocket API 端口",
@@ -806,6 +806,57 @@
     "type": "bool",
     "hint": "开启后，直播自动回应会先等待 TTS 音频生成，再同时发送语音、可见文字并推送 OBS 打字机字幕；关闭时文字和字幕先出，TTS 后台补发。需要同时开启“直播自动回应请求语音回复”。",
     "default": true
+  },
+  "live_tts_backend": {
+    "description": "直播 TTS 后端",
+    "type": "string",
+    "hint": "astrbot_provider 使用当前会话的 AstrBot TTS；registered_service 调用已注册工具所属插件的公开合成服务；auto 在外部服务不可用时回退 AstrBot TTS。",
+    "options": [
+      "astrbot_provider",
+      "registered_service",
+      "auto"
+    ],
+    "default": "astrbot_provider"
+  },
+  "live_tts_external_tool_name": {
+    "description": "外部 TTS 注册工具名",
+    "type": "string",
+    "hint": "在拓展页「直播面板 → 直播语音」里可就选（点「刷新列表」重新扫描已注册的 LLM 工具）；手动填写时写工具名即可。插件只借这个工具名定位它所属的插件，不会执行该工具本身。",
+    "default": ""
+  },
+  "live_tts_external_service_method": {
+    "description": "外部 TTS 公开服务方法",
+    "type": "string",
+    "hint": "填写所选工具所属插件公开的合成方法名（拓展页会在选中工具后自动列出可识别的方法，可直接下拉选择）。该方法必须只返回音频路径或含 path 的结果，不能自行发送消息。",
+    "default": "text_to_speech"
+  },
+  "live_tts_external_plugin_name": {
+    "description": "外部 TTS 插件名校验",
+    "type": "string",
+    "hint": "可选校验项；在拓展页选中外部 TTS 工具后会自动填入该工具所属插件名，主要用于避免选错插件。",
+    "default": ""
+  },
+  "live_tts_external_timeout_seconds": {
+    "description": "外部 TTS 超时（秒）",
+    "type": "int",
+    "slider": {
+      "min": 5,
+      "max": 180,
+      "step": 5
+    },
+    "default": 60
+  },
+  "live_tts_emotion_passthrough_enabled": {
+    "description": "透传回复情绪给外部 TTS",
+    "type": "bool",
+    "hint": "开启后，直播回复解析到的情绪（Soullink 意图）会作为 emotion 参数传给外部 TTS 服务；对方方法签名不接受该参数时自动不传，行为与旧版本一致。",
+    "default": true
+  },
+  "live_tts_style_hint_enabled": {
+    "description": "透传朗读语气提示",
+    "type": "bool",
+    "hint": "开启后，把原始情绪词/强度整理成一段朗读语气提示，并随 context 参数传给外部 TTS 服务（同样按签名裁剪）。默认关闭，避免改变既有音色表现。",
+    "default": false
   },
   "bili_live_tts_local_playback_enabled": {
     "description": "直播 TTS 本机播放",

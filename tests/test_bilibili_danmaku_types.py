@@ -189,6 +189,40 @@ class AutoReplyRichDanmakuTests(unittest.TestCase):
         payload = object.__new__(LiveStreamCompanionPageApi)._event_payload(event)
         self.assertEqual(payload["dm_type"], 1)
 
+    def test_management_page_exposes_external_live_tts_settings(self):
+        manager = PageConfigManager(SimpleNamespace(config={}), "test", Mock())
+        expected_keys = {
+            "bili_live_auto_reply_force_full_tts",
+            "twitch_auto_reply_tts_enabled",
+            "live_tts_backend",
+            "live_tts_external_tool_name",
+            "live_tts_external_service_method",
+            "live_tts_external_plugin_name",
+            "live_tts_external_timeout_seconds",
+            "bili_live_auto_reply_sync_tts_subtitle",
+            "bili_live_tts_local_playback_enabled",
+            "bili_live_tts_web_playback_enabled",
+        }
+
+        self.assertTrue(expected_keys.issubset(manager.editable_keys()))
+        audio_group = next(
+            item for item in manager.groups() if item.get("id") == "audio"
+        )
+        self.assertEqual(audio_group["title"], "直播语音（TTS）")
+        self.assertEqual(set(audio_group["keys"]), expected_keys)
+        payload = manager.schema_payload()
+        self.assertTrue(expected_keys.issubset(payload["schema"]))
+        updates = manager.build_updates(
+            {
+                "live_tts_backend": "auto",
+                "live_tts_external_tool_name": "demo_tts_tool",
+                "live_tts_external_timeout_seconds": "75",
+            }
+        )
+        self.assertEqual(updates["live_tts_backend"], "auto")
+        self.assertEqual(updates["live_tts_external_tool_name"], "demo_tts_tool")
+        self.assertEqual(updates["live_tts_external_timeout_seconds"], 75)
+
 
 if __name__ == "__main__":
     unittest.main()

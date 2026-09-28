@@ -1942,3 +1942,31 @@ input[type="range"] {
     grid-column: span 2;
   }
 }
+
+/* 动态下拉（VTS 地址 / 外部 TTS 服务） */
+.field-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.field-actions .config-control {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.field-actions button {
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.field-note {
+  display: block;
+  min-height: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}

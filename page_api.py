@@ -14,10 +14,21 @@ from typing import Any
 from astrbot.api import logger
 from quart import request
 
+from .config_options import (
+    build_external_tts_options,
+    build_probe_targets,
+    candidate_label,
+    normalize_host_entries,
+    subnet_hosts,
+)
 from .page_config import PageConfigManager
+from .vts_discovery import scan_vts_hosts
 
 PLUGIN_NAME = "astrbot_plugin_live_stream_companion"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"
+
+# 单次扫描的地址上限，避免误操作扫出过大的网段
+MAX_VTS_PROBE_HOSTS = 768
 
 
 class LiveStreamCompanionPageApi:
@@ -36,6 +47,8 @@ class LiveStreamCompanionPageApi:
             ("/overview", self.get_overview, ["GET"], "Live Stream Companion overview"),
             ("/memory", self.get_memory, ["GET"], "Live Stream Companion live memory"),
             ("/config/schema", self.get_config_schema, ["GET"], "Live Stream Companion config schema"),
+            ("/options/external-tts", self.get_external_tts_options, ["GET"], "Live Stream Companion external TTS services"),
+            ("/options/vts-candidates", self.get_vts_candidates, ["GET"], "Live Stream Companion VTS candidates"),
             ("/config/save", self.save_config, ["POST"], "Live Stream Companion save config"),
             ("/subtitle/preview", self.preview_subtitle, ["POST"], "Live Stream Companion subtitle preview"),
             ("/soullink/status", self.get_soullink_status, ["GET"], "Soullink Emotion status"),
@@ -144,6 +157,120 @@ class LiveStreamCompanionPageApi:
         except Exception as exc:
             logger.warning(f"[B站直播] 拓展页配置保存失败: {exc}")
             return self._error(str(exc))
+
+    async def get_external_tts_options(self) -> dict[str, Any]:
+        """列出可用的外部 TTS 注册服务，供拓展页渲染下拉选项。"""
+        try:
+            manager = self.plugin.context.get_llm_tool_manager()
+        except Exception as exc:
+            logger.warning(f"[B站直播] 读取 LLM 工具管理器失败: {exc}")
+            return self._error(f"读取工具管理器失败：{exc}")
+        tools = list(getattr(manager, "func_list", []) or [])
+        described = build_external_tts_options(tools)
+        services = [item for item in described if item.get("methods")]
+        others = [item for item in described if not item.get("methods")]
+        if not tools:
+            logger.info("[B站直播] 外部 TTS 工具清单：LLM 工具管理器里目前没有已注册工具。")
+        elif not services:
+            logger.info(
+                "[B站直播] 外部 TTS 工具清单：已注册 %d 个工具，但没有识别到带公开合成方法的服务（已回退列出全部工具）。",
+                len(tools),
+            )
+        else:
+            logger.info(
+                "[B站直播] 外部 TTS 工具清单：已注册 %d 个工具，识别到 %d 个合成服务：%s",
+                len(tools),
+                len(services),
+                ", ".join(item["tool"] for item in services[:5]),
+            )
+        config = getattr(self.plugin, "config", {}) or {}
+        return self._ok(
+            {
+                # services: 能取到公开合成方法的工具；tools: 其余已注册工具（供手动选择）
+                "services": services,
+                "tools": others,
+                "totalTools": len(tools),
+                "resolvedTools": sum(1 for item in described if item.get("has_plugin")),
+                "current": {
+                    "tool": str(config.get("live_tts_external_tool_name", "") or ""),
+                    "plugin": str(config.get("live_tts_external_plugin_name", "") or ""),
+                    "method": str(
+                        config.get("live_tts_external_service_method", "text_to_speech") or ""
+                    ),
+                },
+            }
+        )
+
+    async def get_vts_candidates(self) -> dict[str, Any]:
+        """探测本机 / 已配置地址 / 指定网段上的 VTS，作为 ``vts_host`` 下拉选项。"""
+        config = getattr(self.plugin, "config", {}) or {}
+        configured_host = str(config.get("vts_host", "") or "").strip()
+        try:
+            configured_port = int(config.get("vts_port") or 8001)
+        except (TypeError, ValueError):
+            configured_port = 8001
+        args = getattr(request, "args", None)
+        mode = str(args.get("mode") if args else "" or "quick").strip().lower()
+        extra_hosts = normalize_host_entries(args.get("hosts") if args else "")
+        explicit_subnet = str(args.get("subnet") if args else "" or "").strip()
+        extra_subnets = [explicit_subnet] if explicit_subnet else []
+        include_scan = mode == "scan" or bool(explicit_subnet) or bool(extra_hosts)
+        plan = build_probe_targets(
+            configured_host=configured_host,
+            configured_port=configured_port,
+            request_host=str(getattr(request, "host", "") or ""),
+            extra_hosts=extra_hosts,
+            extra_subnets=extra_subnets,
+            include_scan=include_scan,
+        )
+        hosts = list(plan["hosts"])
+        scanned_subnets: list[str] = []
+        for subnet in plan["subnets"]:
+            scanned_subnets.append(subnet)
+            for host in subnet_hosts(subnet):
+                if host not in hosts:
+                    hosts.append(host)
+        truncated = False
+        if len(hosts) > MAX_VTS_PROBE_HOSTS:
+            hosts = hosts[:MAX_VTS_PROBE_HOSTS]
+            truncated = True
+        try:
+            found = await scan_vts_hosts(
+                hosts,
+                ports=plan["ports"],
+                timeout=0.8 if include_scan else 1.5,
+                concurrency=96,
+            )
+        except Exception as exc:
+            logger.warning(f"[B站直播] VTS 地址探测失败: {exc}")
+            return self._error(f"VTS 地址探测失败：{exc}")
+        candidates = []
+        for item in found:
+            host = str(item.get("host", ""))
+            port = int(item.get("port") or 8001)
+            version = str(item.get("version", "") or "")
+            candidates.append(
+                {
+                    "host": host,
+                    "port": port,
+                    "version": version,
+                    "label": candidate_label(host, port, version),
+                    "configured": host == configured_host and port == configured_port,
+                }
+            )
+        return self._ok(
+            {
+                "mode": "scan" if include_scan else "quick",
+                "candidates": candidates,
+                "configured": {"host": configured_host, "port": configured_port},
+                "scanned": {
+                    "hosts": len(hosts),
+                    "ports": plan["ports"],
+                    "subnets": scanned_subnets,
+                    "truncated": truncated,
+                },
+            }
+        )
 
     async def preview_subtitle(self) -> dict[str, Any]:
         try:

@@ -432,6 +432,11 @@ class SoullinkMixin:
         if not self._is_soullink_enabled():
             return text
         intent, cleaned = self._parse_soullink_intent(text)
+        cache = getattr(self, "_live_tts_style_cache", None)
+        if cache is not None:
+            # 同一条回复稍后合成语音时按这段文本取回该意图（不跨回复串台）；
+            # 没解析出意图时也记一条，避免复用上一条回复的情绪。
+            cache.store(cleaned, intent)
         runtime = getattr(self, "_soullink_runtime", None)
         if not runtime or not runtime.running:
             return cleaned

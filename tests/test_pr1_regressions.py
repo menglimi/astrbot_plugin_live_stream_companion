@@ -219,6 +219,140 @@ class ExternalCompanionAPITests(unittest.IsolatedAsyncioTestCase):
             await blocker
 
 
+class ExternalLiveTtsTests(unittest.IsolatedAsyncioTestCase):
+    def _plugin(self, **config):
+        plugin = object.__new__(VTubeStudioPlugin)
+        plugin.config = config
+        return plugin
+
+    async def test_registered_service_uses_plugin_method_not_tool_handler(self):
+        class VoiceService:
+            plugin_id = "astrbot_plugin_demo_tts"
+
+            async def text_to_speech(self, text, *, session_id=""):
+                return f"{session_id}:{text}.wav"
+
+        service = VoiceService()
+        handler_calls = []
+
+        async def tool_handler(*_args, **_kwargs):
+            handler_calls.append(True)
+            return "should-not-run.wav"
+
+        tool = SimpleNamespace(handler=tool_handler)
+        manager = SimpleNamespace(get_tool=lambda name: tool if name == "demo_tts_tool" else None)
+        plugin = self._plugin(
+            live_tts_external_tool_name="demo_tts_tool",
+            live_tts_external_service_method="text_to_speech",
+            live_tts_external_plugin_name="astrbot_plugin_demo_tts",
+        )
+        plugin.context = SimpleNamespace(get_llm_tool_manager=lambda: manager)
+
+        # A partial is a common AstrBot tool registration shape.
+        import functools
+
+        tool.handler = functools.partial(tool_handler, service)
+        found = plugin._find_live_tts_registered_service()
+
+        self.assertIs(found, service)
+        self.assertEqual(
+            await plugin._synthesize_live_tts_with_registered_service(found, "hello", "live:1"),
+            "live:1:hello.wav",
+        )
+        self.assertEqual(handler_calls, [])
+
+    def test_registered_service_rejects_wrong_plugin_name(self):
+        class VoiceService:
+            plugin_id = "another_plugin"
+
+            async def text_to_speech(self, text):
+                return text
+
+        service = VoiceService()
+        tool = SimpleNamespace(handler=__import__("functools").partial(lambda _service: None, service))
+        manager = SimpleNamespace(get_tool=lambda _name: tool)
+        plugin = self._plugin(
+            live_tts_external_tool_name="demo_tts_tool",
+            live_tts_external_service_method="text_to_speech",
+            live_tts_external_plugin_name="astrbot_plugin_demo_tts",
+        )
+        plugin.context = SimpleNamespace(get_llm_tool_manager=lambda: manager)
+
+        self.assertIsNone(plugin._find_live_tts_registered_service())
+
+    def test_registered_service_accepts_plugin_id_from_metadata(self):
+        class VoiceService:
+            metadata = SimpleNamespace(name="astrbot_plugin_demo_tts")
+
+            async def text_to_speech(self, text):
+                return text
+
+        service = VoiceService()
+        tool = SimpleNamespace(handler=__import__("functools").partial(lambda _service: None, service))
+        manager = SimpleNamespace(get_tool=lambda _name: tool)
+        plugin = self._plugin(
+            live_tts_external_tool_name="demo_tts_tool",
+            live_tts_external_service_method="text_to_speech",
+            live_tts_external_plugin_name="astrbot_plugin_demo_tts",
+        )
+        plugin.context = SimpleNamespace(get_llm_tool_manager=lambda: manager)
+
+        self.assertIs(plugin._find_live_tts_registered_service(), service)
+
+    async def test_external_tts_accepts_path_mapping_and_invalid_timeout(self):
+        class VoiceService:
+            async def render_pcm_wav(self, text, *, session_id=""):
+                return {"path": f"{session_id}-{text}.wav"}
+
+        plugin = self._plugin(
+            live_tts_external_service_method="render_pcm_wav",
+            live_tts_external_timeout_seconds="not-a-number",
+        )
+
+        self.assertEqual(
+            await plugin._synthesize_live_tts_with_registered_service(
+                VoiceService(), "hello", "live:2"
+            ),
+            "live:2-hello.wav",
+        )
+
+    async def test_auto_backend_falls_back_to_session_provider_when_external_returns_empty(self):
+        class ExternalService:
+            async def text_to_speech(self, _text):
+                return ""
+
+        class SessionProvider:
+            def __init__(self):
+                self.calls = []
+
+            async def get_audio(self, text):
+                self.calls.append(text)
+                return "fallback.wav"
+
+        provider = SessionProvider()
+        plugin = self._plugin(live_tts_backend="auto")
+        plugin._find_live_tts_registered_service = lambda: ExternalService()
+        plugin._get_live_tts_provider = lambda _session_id: provider
+        plugin._strip_tts_blocks_from_text = lambda text: text
+        plugin._convert_bili_live_tts_spoken_text = (
+            lambda _session_id, text, _service: asyncio.sleep(0, result=text)
+        )
+        plugin._sanitize_bili_live_tts_spoken_text = lambda text, **_kwargs: text
+        plugin._prepare_bili_live_audio_for_record = lambda path: path
+        plugin._build_bili_live_tts_subtitle_text = lambda **_kwargs: "subtitle"
+        plugin._schedule_bili_live_tts_local_playback = lambda _path: None
+        plugin._bili_live_tts_web_playback_enabled = lambda: False
+        plugin._after_bili_live_tts_audio_generated = lambda *_args, **_kwargs: asyncio.sleep(0)
+        plugin._companion_tts_live_subtitle_enabled = lambda: True
+
+        payload = await plugin._build_bili_live_tts_payload(
+            "live:3", "hello", schedule_local_playback=False
+        )
+
+        self.assertEqual(provider.calls, ["hello"])
+        self.assertEqual(payload["source_audio_path"], "fallback.wav")
+
+
 class SubtitleServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_audio_registration_requires_running_server_and_real_file(self):
         server = SubtitleServer("127.0.0.1", 0, {})
